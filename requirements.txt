@@ -1,0 +1,15 @@
+# Real-Time Waste Detection System v4.0
+# Python 3.10+ recommended
+
+# Core
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# AI detection (recommended)
+ultralytics>=8.0.0          # YOLOv8 — auto-downloads yolov8n.pt on first run
+
+# Modern UI theme (optional but recommended)
+ttkbootstrap>=1.10.0
+
+# No additional dependencies needed — sqlite3 is part of Python stdlib
