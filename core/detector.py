@@ -88,6 +88,11 @@ class WasteDetector:
         else:
             detections = self._contour_detect(frame)
 
+        detections = [
+            det for det in detections
+            if det.get("confidence", 0.0) >= self.CONFIDENCE_THRESHOLD
+        ]
+
         # Enrich each detection with scientific + geometric metadata
         enriched = []
         for det in detections[:self.MAX_DETECTIONS]:

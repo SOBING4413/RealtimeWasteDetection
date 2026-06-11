@@ -83,6 +83,13 @@ class WasteDetectionApp:
         self.detection_active   = True
         self.sound_enabled      = True
         self.radiation_monitor  = True
+        self.conf_threshold     = tk.DoubleVar(value=self.detector.CONFIDENCE_THRESHOLD)
+        self.roi_enabled        = tk.BooleanVar(value=True)
+        self.roi_rect_norm      = (0.18, 0.16, 0.82, 0.84)
+        self._scan_phase        = 0.0
+        self._last_alert_ts     = 0.0
+        self._last_alert_name   = None
+        self._summary_open      = False
 
         # Detection history
         self.history       = deque(maxlen=200)
@@ -94,6 +101,7 @@ class WasteDetectionApp:
         self.hazardous_count = 0
         self.recycle_count   = 0
         self.radiation_max   = 0.10
+        self.category_counts = Counter()
 
         # FPS tracking
         self.fps            = 0.0
@@ -104,6 +112,7 @@ class WasteDetectionApp:
         self.chart_tox  = deque([0.0] * CHART_HISTORY, maxlen=CHART_HISTORY)
         self.chart_rad  = deque([0.0] * CHART_HISTORY, maxlen=CHART_HISTORY)
         self.chart_fps  = deque([0.0] * CHART_HISTORY, maxlen=CHART_HISTORY)
+        self.chart_count = deque([0] * CHART_HISTORY, maxlen=CHART_HISTORY)
         self._last_chart_update = 0.0
 
         self._build_ui()
@@ -193,10 +202,43 @@ class WasteDetectionApp:
         self.chip_hazard   = self._chip(chips, "HAZARDOUS",   "0",    DANGER,  2)
         self.chip_recycle  = self._chip(chips, "RECYCLABLE",  "0",    "#44bb66", 3)
 
+        # Live category counter sidebar strip
+        counter_frame = tk.LabelFrame(rf, text=" Live Category Counter ",
+                                      font=(UI_FONT, 8, "bold"), fg=ACCENT, bg=BG2, relief="flat")
+        counter_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 0))
+        self.lbl_category_counts = tk.Label(
+            counter_frame, text="No detections yet", justify="left", anchor="w",
+            font=(MONO, 8), fg=FG, bg=BG, padx=8, pady=5
+        )
+        self.lbl_category_counts.pack(fill="x", padx=4, pady=3)
+
+        # Detection controls for ROI and confidence filtering
+        filter_frame = tk.Frame(rf, bg=BG2)
+        filter_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 0))
+        filter_frame.grid_columnconfigure(1, weight=1)
+        self.chk_roi = tk.Checkbutton(
+            filter_frame, text="ROI zone", variable=self.roi_enabled,
+            bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
+            activeforeground=ACCENT, font=(UI_FONT, 8), cursor="hand2"
+        )
+        self.chk_roi.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        tk.Label(filter_frame, text="Confidence", font=(UI_FONT, 8), fg=FG_DIM, bg=BG2).grid(row=0, column=1, sticky="w")
+        self.conf_value_lbl = tk.Label(filter_frame, text=f"{self.conf_threshold.get():.0%}",
+                                       font=(MONO, 8, "bold"), fg=ACCENT, bg=BG2)
+        self.conf_value_lbl.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        self.conf_slider = tk.Scale(
+            filter_frame, from_=0.10, to=0.95, resolution=0.05, orient="horizontal",
+            variable=self.conf_threshold, command=self._on_conf_threshold_changed,
+            showvalue=False, bg=BG2, fg=FG_DIM, troughcolor=BG3,
+            highlightthickness=0, activebackground=ACCENT
+        )
+        self.conf_slider.grid(row=0, column=2, sticky="ew", padx=6)
+        filter_frame.grid_columnconfigure(2, weight=1)
+
         # Notebook
         self.nb = ttk.Notebook(rf)
-        self.nb.grid(row=2, column=0, sticky="nsew", padx=8, pady=6)
-        rf.grid_rowconfigure(2, weight=1)
+        self.nb.grid(row=4, column=0, sticky="nsew", padx=8, pady=6)
+        rf.grid_rowconfigure(4, weight=1)
 
         self._build_tab_detail()
         self._build_tab_charts()
@@ -382,6 +424,7 @@ class WasteDetectionApp:
         self._draw_timeline()
         self._draw_fps_chart()
         self._draw_category_chart()
+        self._draw_session_dashboard()
 
     def _draw_line_chart(self, canvas, datasets, title, y_max=1.0):
         """Generic polyline chart with grid."""
@@ -471,6 +514,41 @@ class WasteDetectionApp:
                                anchor="w", fill=FG_DIM, font=(MONO, 7))
             y += bar_h + 4
 
+    def _draw_session_dashboard(self):
+        """Draw historical detections-per-session-sample bars for the current session."""
+        if not hasattr(self, "chart_session"):
+            return
+        canvas = self.chart_session
+        canvas.delete("all")
+        W = canvas.winfo_width()
+        H = canvas.winfo_height()
+        if W < 10 or H < 10:
+            return
+
+        data = list(self.chart_count)
+        max_v = max(max(data), 1)
+        pad_l, pad_t, pad_b = 34, 14, 22
+        cw = W - pad_l - 10
+        ch = H - pad_t - pad_b
+
+        for gi in range(4):
+            gy = pad_t + ch * gi // 3
+            canvas.create_line(pad_l, gy, W - 8, gy, fill="#1e2a3a", dash=(2, 4))
+            val = int(max_v * (1 - gi / 3))
+            canvas.create_text(pad_l - 5, gy, text=str(val), anchor="e", fill=FG_DIM, font=(MONO, 7))
+
+        if len(data) >= 2:
+            bar_w = max(2, cw // len(data) - 1)
+            for i, v in enumerate(data):
+                x1 = pad_l + int(i * cw / len(data))
+                x2 = x1 + bar_w
+                y1 = pad_t + ch - int((v / max_v) * ch)
+                canvas.create_rectangle(x1, y1, x2, pad_t + ch, fill=ACCENT2, outline="")
+
+        canvas.create_text(W // 2, H - 7,
+                           text="Historical detections per refresh window (current session)",
+                           fill=FG_DIM, font=(UI_FONT, 7))
+
     # ------------------------------------------------------------------
     # Tab 3: Stats
     # ------------------------------------------------------------------
@@ -480,14 +558,22 @@ class WasteDetectionApp:
         tab.grid_rowconfigure(0, weight=1)
         tab.grid_columnconfigure(0, weight=1)
 
-        sb2 = tk.Scrollbar(tab)
+        dash = tk.LabelFrame(tab, text=" Detection Statistics Dashboard ",
+                              font=(UI_FONT, 9, "bold"), fg=ACCENT, bg=BG2, relief="flat")
+        dash.pack(fill="x", padx=6, pady=(6, 3))
+        self.chart_session = tk.Canvas(dash, bg=BG, height=120, highlightthickness=0)
+        self.chart_session.pack(fill="x", expand=False, padx=4, pady=4)
+
+        text_frame = tk.Frame(tab, bg=BG2)
+        text_frame.pack(fill="both", expand=True, padx=6, pady=(3, 6))
+        sb2 = tk.Scrollbar(text_frame)
         sb2.pack(side="right", fill="y")
         self.txt_stats = tk.Text(
-            tab, font=(MONO, 9), bg=BG, fg=FG,
+            text_frame, font=(MONO, 9), bg=BG, fg=FG,
             relief="flat", bd=0, wrap="word",
             yscrollcommand=sb2.set, state="disabled"
         )
-        self.txt_stats.pack(fill="both", expand=True, padx=6, pady=6)
+        self.txt_stats.pack(fill="both", expand=True)
         sb2.config(command=self.txt_stats.yview)
         self.txt_stats.tag_config("h",  foreground=ACCENT,  font=(MONO, 9, "bold"))
         self.txt_stats.tag_config("v",  foreground=FG,      font=(MONO, 9))
@@ -542,7 +628,7 @@ class WasteDetectionApp:
     # ------------------------------------------------------------------
     def _build_controls(self, parent):
         ctrl = tk.Frame(parent, bg=BG2)
-        ctrl.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ctrl.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
         for i in range(6):
             ctrl.grid_columnconfigure(i, weight=1)
 
@@ -625,6 +711,128 @@ class WasteDetectionApp:
         return frame
 
     # ==================================================================
+    # Detection UI helpers
+    # ==================================================================
+    def _on_conf_threshold_changed(self, value):
+        threshold = float(value)
+        self.detector.CONFIDENCE_THRESHOLD = threshold
+        self.conf_value_lbl.config(text=f"{threshold:.0%}")
+
+    def _roi_pixels(self, width: int, height: int):
+        x1n, y1n, x2n, y2n = self.roi_rect_norm
+        return (int(x1n * width), int(y1n * height), int(x2n * width), int(y2n * height))
+
+    def _det_in_roi(self, det: dict, width: int, height: int) -> bool:
+        if not self.roi_enabled.get():
+            return True
+        x1, y1, x2, y2 = self._roi_pixels(width, height)
+        cx, cy = det.get("center", ((det["bbox"][0] + det["bbox"][2]) // 2,
+                                      (det["bbox"][1] + det["bbox"][3]) // 2))
+        return x1 <= cx <= x2 and y1 <= cy <= y2
+
+    def _draw_roi_overlay(self, frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = self._roi_pixels(w, h)
+        color = (60, 210, 160) if self.roi_enabled.get() else (90, 90, 90)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 1)
+        if self.roi_enabled.get():
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+            cv2.addWeighted(overlay, 0.08, frame, 0.92, 0, frame)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, "ROI MONITOR ZONE", (x1 + 8, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        return frame
+
+    def _draw_scanning_line(self, frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = self._roi_pixels(w, h) if self.roi_enabled.get() else (0, 38, w, h - 30)
+        span = max(1, y2 - y1)
+        self._scan_phase = (self._scan_phase + 0.015) % 1.0
+        y = y1 + int(self._scan_phase * span)
+        overlay = frame.copy()
+        cv2.line(overlay, (x1, y), (x2, y), (0, 255, 180), 2)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+        cv2.line(frame, (x1, max(y1, y - 6)), (x2, max(y1, y - 6)), (0, 120, 80), 1)
+        cv2.line(frame, (x1, min(y2, y + 6)), (x2, min(y2, y + 6)), (0, 120, 80), 1)
+        return frame
+
+    def _draw_minimap(self, frame: np.ndarray, detections: list[dict]) -> np.ndarray:
+        h, w = frame.shape[:2]
+        mw, mh = 150, 105
+        x0, y0 = w - mw - 12, 48
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + mw, y0 + mh), (12, 16, 24), -1)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+        cv2.rectangle(frame, (x0, y0), (x0 + mw, y0 + mh), (70, 90, 120), 1)
+        cv2.putText(frame, "MINI-MAP", (x0 + 8, y0 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (210, 220, 230), 1, cv2.LINE_AA)
+
+        if self.roi_enabled.get():
+            rx1, ry1, rx2, ry2 = self._roi_pixels(w, h)
+            mm = lambda px, py: (x0 + int(px * mw / w), y0 + 20 + int(py * (mh - 25) / h))
+            p1 = mm(rx1, ry1)
+            p2 = mm(rx2, ry2)
+            cv2.rectangle(frame, p1, p2, (60, 210, 160), 1)
+
+        for det in detections[:20]:
+            s = det.get("science", {})
+            color = _color(s.get("category", "Unknown"))
+            cx, cy = det.get("center", (0, 0))
+            px = x0 + int(cx * mw / max(w, 1))
+            py = y0 + 20 + int(cy * (mh - 25) / max(h, 1))
+            cv2.circle(frame, (px, py), 4, color, -1)
+            cv2.circle(frame, (px, py), 6, (230, 230, 230), 1)
+        return frame
+
+    def _update_category_counter(self):
+        if not self.category_counts:
+            text = "No detections yet"
+        else:
+            parts = [f"{cat}: {cnt}" for cat, cnt in self.category_counts.most_common(6)]
+            text = "   •   ".join(parts)
+        self.lbl_category_counts.config(text=text)
+
+    def _show_threat_alert(self, det: dict):
+        now = time.monotonic()
+        name = det.get("waste_name", "object")
+        if self._last_alert_name == name and now - self._last_alert_ts < 6.0:
+            return
+        self._last_alert_name = name
+        self._last_alert_ts = now
+        s = det.get("science", {})
+        msg = (f"Object Threat Alert\n\n"
+               f"Object: {name.replace('_', ' ').title()}\n"
+               f"Category: {s.get('category', 'Unknown')}\n"
+               f"Toxicity: {s.get('toxicity', 0):.2f}\n"
+               f"Confidence: {det.get('confidence', 0):.0%}\n\n"
+               f"Recommended action: isolate item and follow hazardous disposal procedure.")
+        self.root.after(0, lambda: messagebox.showwarning("Object Threat Alert", msg, parent=self.root))
+
+    def _session_summary_text(self):
+        elapsed = time.monotonic() - self.session_start
+        mins, secs = divmod(int(elapsed), 60)
+        hrs, mins = divmod(mins, 60)
+        cat = ", ".join(f"{k}: {v}" for k, v in self.category_counts.most_common(5)) or "No categories"
+        return (f"Session Summary\n\n"
+                f"Session ID: {self.session_id}\n"
+                f"Duration: {hrs:02d}:{mins:02d}:{secs:02d}\n"
+                f"Total detections: {self.total_count}\n"
+                f"Hazardous: {self.hazardous_count}\n"
+                f"Recyclable: {self.recycle_count}\n"
+                f"Peak radiation: {self.radiation_max:.4f} uSv/h\n"
+                f"Categories: {cat}")
+
+    def _show_session_summary(self):
+        if self._summary_open:
+            return
+        self._summary_open = True
+        try:
+            messagebox.showinfo("Detection Session Summary", self._session_summary_text(), parent=self.root)
+        finally:
+            self._summary_open = False
+
+    # ==================================================================
     # Main update loop
     # ==================================================================
     def _update_frame(self):
@@ -640,6 +848,7 @@ class WasteDetectionApp:
             if self.detection_active:
                 new_dets = self.detector.detect(frame)
                 if new_dets:
+                    new_dets = [det for det in new_dets if self._det_in_roi(det, fw, fh)]
                     self.current_dets = new_dets
                     for det in new_dets:
                         if det["waste_name"] != self.last_det_name:
@@ -647,8 +856,11 @@ class WasteDetectionApp:
                             self.last_det_name = det["waste_name"]
 
             # Render overlay
-            for det in self.current_dets:
-                frame = draw_detection(frame, det, 0)
+            frame = self._draw_roi_overlay(frame)
+            frame = self._draw_scanning_line(frame)
+            for idx, det in enumerate(self.current_dets):
+                frame = draw_detection(frame, det, idx)
+            frame = self._draw_minimap(frame, self.current_dets)
 
             rad_max = max((d.get("radiation_sim", 0.1) for d in self.current_dets), default=self.radiation_max)
             self.radiation_max = max(self.radiation_max, rad_max)
@@ -666,6 +878,7 @@ class WasteDetectionApp:
                 self.frame_count = 0
                 self.fps_ts = now
                 self.chart_fps.append(self.fps)
+                self.chart_count.append(self.total_count)
 
             # Display
             cw = self.canvas.winfo_width()
@@ -686,6 +899,7 @@ class WasteDetectionApp:
             self.chip_total.config(text=str(self.total_count))
             self.chip_hazard.config(text=str(self.hazardous_count))
             self.chip_recycle.config(text=str(self.recycle_count))
+            self._update_category_counter()
 
             mode_txt = "LIVE" if not self.using_sim else "SIMULATION"
             mode_col = ACCENT if not self.using_sim else WARN
@@ -721,6 +935,7 @@ class WasteDetectionApp:
 
         if tox > 0.5:   self.hazardous_count += 1
         if rec > 0.5:   self.recycle_count += 1
+        self.category_counts[s.get("category", "Unknown")] += 1
 
         # Chart data
         self.chart_tox.append(tox)
@@ -742,9 +957,11 @@ class WasteDetectionApp:
         # UI detail update
         self._update_detail(det)
 
-        # Sound alert
-        if tox > 0.7 and self.sound_enabled and _SOUND:
-            threading.Thread(target=self._beep, daemon=True).start()
+        # Sound and popup alert
+        if tox > 0.7:
+            self._show_threat_alert(det)
+            if self.sound_enabled and _SOUND:
+                threading.Thread(target=self._beep, daemon=True).start()
 
     def _beep(self):
         try:
@@ -764,6 +981,7 @@ class WasteDetectionApp:
             self.current_dets = []
         else:
             self.btn_toggle.config(text="RESUME", bg="#226622")
+            self._show_session_summary()
 
     def _toggle_sound(self):
         self.sound_enabled = not self.sound_enabled
